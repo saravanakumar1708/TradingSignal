@@ -8,8 +8,8 @@ import pandas as pd
 import numpy as np
 from supabase import create_client, Client
 
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, Bot
+from telegram.ext import Dispatcher, CommandHandler, ContextTypes
 
 # ==================================================
 # SUPABASE SETUP
@@ -17,11 +17,20 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 TABLE_NAME = "last_signal"  # Table with columns: id (int), signal (text), created_at (timestamp)
 
 # ==================================================
-# STRATEGY FUNCTION
+# TELEGRAM SETUP
+# ==================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")  # Group or personal chat ID
+bot = Bot(BOT_TOKEN)
+
+# Dispatcher for processing Telegram updates
+dispatcher = Dispatcher(bot, None, workers=0)
+
+# ==================================================
+# TRADING STRATEGY FUNCTION
 # ==================================================
 def run_trading_strategy():
     ticker = "^NSEI"
@@ -44,7 +53,6 @@ def run_trading_strategy():
     # ---- STOCHASTICS (14,3,3)
     k_period = 14
     d_period = 3
-
     data['Low_14'] = data['Low'].rolling(k_period).min()
     data['High_14'] = data['High'].rolling(k_period).max()
     data['%K'] = 100 * ((data['Close'] - data['Low_14']) / (data['High_14'] - data['Low_14']))
@@ -95,7 +103,6 @@ def run_trading_strategy():
         signal = "BUY PUT"
         strike = round((current_price - 300) / 50) * 50
 
-    # Prepare output
     output = (
         f"Date: {datetime.now().strftime('%Y-%m-%d')}\n"
         f"Nifty Price: {current_price:.2f}\n"
@@ -103,68 +110,54 @@ def run_trading_strategy():
         f"Renko: {pattern}\n"
         f"Signal: {signal}"
     )
-
     if strike:
         output += f"\nStrike: {strike}"
 
     return output, signal
 
 # ==================================================
-# TELEGRAM BOT HANDLER
+# TELEGRAM COMMAND HANDLERS
 # ==================================================
-async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    buffer = io.StringIO()
-    sys.stdout = buffer
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Trading Bot Active ✅\nUse /run to get current signal"
+    )
 
+async def run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         output, signal = run_trading_strategy()
     except Exception as e:
         output = f"Error: {e}"
         signal = None
 
-    sys.stdout = sys.__stdout__
+    # Send response to user who called /run
+    await update.message.reply_text(output)
 
-    # Send Telegram message if /run command
-    await context.bot.send_message(chat_id=update.effective_chat.id, text=output)
-
-    # Get last signal from Supabase
+    # Fetch last signal from Supabase
     last_signal_data = supabase.table(TABLE_NAME).select("signal").order("id", desc=True).limit(1).execute()
     last_signal = None
     if last_signal_data.data:
         last_signal = last_signal_data.data[0]["signal"]
 
-    # Send alert only if signal changed
+    # Send alert if signal changed
     if signal and signal != last_signal:
-        chat_id = os.environ.get("CHAT_ID")
-        if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚡ New Signal: {signal}\n{output}")
-
-        # Insert new signal into Supabase
+        if CHAT_ID:
+            await bot.send_message(chat_id=CHAT_ID, text=f"⚡ New Signal: {signal}\n{output}")
         supabase.table(TABLE_NAME).insert({"signal": signal}).execute()
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="Trading Bot Active ✅\nUse /run to get current signal",
-    )
+# Register handlers with dispatcher
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("run", run))
 
 # ==================================================
-# MAIN
+# VERCEL SERVERLESS HANDLER
 # ==================================================
-def main():
-    BOT_TOKEN = os.environ.get("BOT_TOKEN")
-    if not BOT_TOKEN:
-        print("Error: BOT_TOKEN environment variable not set")
-        return
-
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("run", run_command))
-
-    print("🤖 Telegram bot is running...")
-    app.run_polling(poll_interval=3)
-
-
-if __name__ == "__main__":
-    main()
+async def handler(request):
+    """Vercel serverless function entrypoint"""
+    if request.method == "POST":
+        json_data = await request.json()
+        update = Update.de_json(json_data, bot)
+        await dispatcher.process_update(update)
+        return {"status": "ok"}
+    else:
+        return {"status": "error", "message": "Use POST request"}
