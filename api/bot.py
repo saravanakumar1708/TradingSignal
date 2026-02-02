@@ -1,32 +1,50 @@
+import os
+import io
+import sys
+from datetime import datetime
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import io
-import sys
-import json
+from supabase import create_client, Client
 
-from telegram import Bot
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-BOT_TOKEN = "8277622547:AAEzSwX7XcpAStzpSWW3lyQY9flvxvx7ZEU"
+# ==================================================
+# SUPABASE SETUP
+# ==================================================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+TABLE_NAME = "last_signal"  # Table with columns: id (int), signal (text), created_at (timestamp)
+
+# ==================================================
+# STRATEGY FUNCTION
+# ==================================================
 def run_trading_strategy():
-    """Returns string output with BUY/SELL/NO ENTRY"""
-    buffer = io.StringIO()
-    sys.stdout = buffer
-
     ticker = "^NSEI"
 
     try:
-        data = yf.download(ticker, period="3mo", interval="1d", progress=False)
-        data.dropna(inplace=True)
-    except:
-        print("Error fetching data")
-        sys.stdout = sys.__stdout__
-        return "Error fetching data"
+        data = yf.download(
+            ticker, period="3mo", interval="1d", progress=False, auto_adjust=False
+        )
+    except Exception as e:
+        return f"Error downloading data: {e}", None
 
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
+    if len(data) < 20:
+        return "Not enough data fetched.", None
+
+    data.dropna(inplace=True)
+
+    # ---- STOCHASTICS (14,3,3)
     k_period = 14
     d_period = 3
+
     data['Low_14'] = data['Low'].rolling(k_period).min()
     data['High_14'] = data['High'].rolling(k_period).max()
     data['%K'] = 100 * ((data['Close'] - data['Low_14']) / (data['High_14'] - data['Low_14']))
@@ -36,7 +54,7 @@ def run_trading_strategy():
     previous_stoch = data['%K'].iloc[-2]
     current_price = data['Close'].iloc[-1]
 
-    # Renko
+    # ---- RENKO (Brick Size = 20)
     brick_size = 20
     bricks = []
     last_brick_price = data['Close'].iloc[0]
@@ -53,48 +71,100 @@ def run_trading_strategy():
                 last_brick_price -= brick_size
 
     if len(bricks) < 3:
-        sys.stdout = sys.__stdout__
-        return "Not enough Renko movement"
+        return "Not enough Renko movement.", None
 
     last_3 = bricks[-3:]
     three_green = all(b == 1 for b in last_3)
     three_red = all(b == -1 for b in last_3)
 
+    pattern = "Green, Green, Green" if three_green else "Red, Red, Red" if three_red else "Mixed/Choppy"
+
+    # ---- SIGNAL LOGIC
     stoch_cross_above_20 = previous_stoch <= 20 and current_stoch > 20
     stoch_cross_below_80 = previous_stoch >= 80 and current_stoch < 80
 
     is_buy = three_green and (stoch_cross_above_20 or (20 < current_stoch < 40))
     is_sell = three_red and (stoch_cross_below_80 or (60 < current_stoch < 80))
 
+    signal = "NO ENTRY"
+    strike = None
     if is_buy:
+        signal = "BUY CALL"
         strike = round((current_price + 300) / 50) * 50
-        print(f"📈 BUY CALL {strike} CE")
     elif is_sell:
+        signal = "BUY PUT"
         strike = round((current_price - 300) / 50) * 50
-        print(f"📉 BUY PUT {strike} PE")
-    else:
-        print("❌ NO ENTRY")
+
+    # Prepare output
+    output = (
+        f"Date: {datetime.now().strftime('%Y-%m-%d')}\n"
+        f"Nifty Price: {current_price:.2f}\n"
+        f"Stoch: {current_stoch:.2f} (Prev: {previous_stoch:.2f})\n"
+        f"Renko: {pattern}\n"
+        f"Signal: {signal}"
+    )
+
+    if strike:
+        output += f"\nStrike: {strike}"
+
+    return output, signal
+
+# ==================================================
+# TELEGRAM BOT HANDLER
+# ==================================================
+async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    buffer = io.StringIO()
+    sys.stdout = buffer
+
+    try:
+        output, signal = run_trading_strategy()
+    except Exception as e:
+        output = f"Error: {e}"
+        signal = None
 
     sys.stdout = sys.__stdout__
-    return buffer.getvalue().strip()
 
-# ---------------- Vercel handler ---------------- #
-def handler(request):
-    """
-    Vercel calls this when Telegram sends /run
-    """
-    try:
-        body = json.loads(request['body']) if request['body'] else {}
-        message_text = body.get("message", {}).get("text", "")
-        chat_id = body.get("message", {}).get("chat", {}).get("id", None)
+    # Send Telegram message if /run command
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=output)
 
-        bot = Bot(token=BOT_TOKEN)
+    # Get last signal from Supabase
+    last_signal_data = supabase.table(TABLE_NAME).select("signal").order("id", desc=True).limit(1).execute()
+    last_signal = None
+    if last_signal_data.data:
+        last_signal = last_signal_data.data[0]["signal"]
 
-        if message_text == "/run" and chat_id:
-            result = run_trading_strategy()
-            bot.send_message(chat_id=chat_id, text=result)
+    # Send alert only if signal changed
+    if signal and signal != last_signal:
+        chat_id = os.environ.get("CHAT_ID")
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚡ New Signal: {signal}\n{output}")
 
-        return {"statusCode": 200, "body": "OK"}
-    except Exception as e:
-        print(e)
-        return {"statusCode": 500, "body": str(e)}
+        # Insert new signal into Supabase
+        supabase.table(TABLE_NAME).insert({"signal": signal}).execute()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Trading Bot Active ✅\nUse /run to get current signal",
+    )
+
+# ==================================================
+# MAIN
+# ==================================================
+def main():
+    BOT_TOKEN = os.environ.get("BOT_TOKEN")
+    if not BOT_TOKEN:
+        print("Error: BOT_TOKEN environment variable not set")
+        return
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("run", run_command))
+
+    print("🤖 Telegram bot is running...")
+    app.run_polling(poll_interval=3)
+
+
+if __name__ == "__main__":
+    main()
