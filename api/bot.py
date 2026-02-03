@@ -1,132 +1,83 @@
 import os
 import json
 from datetime import datetime
+
 import yfinance as yf
 import pandas as pd
-import numpy as np
-from supabase import create_client, Client
-
-from telegram import Update, Bot
-from telegram.ext import ContextTypes
+from supabase import create_client
+from telegram import Bot, Update
 
 # =========================
-# SUPABASE SETUP
-# =========================
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-TABLE_NAME = "last_signal"  # Table with columns: id, signal, created_at
-
-# =========================
-# TELEGRAM SETUP
+# ENV VARIABLES
 # =========================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
 bot = Bot(token=BOT_TOKEN)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+TABLE_NAME = "last_signal"
 
 # =========================
-# TRADING STRATEGY
+# STRATEGY
 # =========================
 def run_trading_strategy():
-    ticker = "^NSEI"
-    try:
-        data = yf.download(ticker, period="3mo", interval="1d", progress=False, auto_adjust=False)
-    except Exception as e:
-        return f"Error downloading data: {e}", None
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    data = yf.download("^NSEI", period="3mo", interval="1d", progress=False)
 
     if len(data) < 20:
-        return "Not enough data fetched.", None
+        return "Not enough data", None
 
-    data.dropna(inplace=True)
+    data["Low_14"] = data["Low"].rolling(14).min()
+    data["High_14"] = data["High"].rolling(14).max()
+    data["%K"] = 100 * ((data["Close"] - data["Low_14"]) / (data["High_14"] - data["Low_14"]))
 
-    # --- STOCHASTICS (14,3,3)
-    k_period = 14
-    d_period = 3
-    data['Low_14'] = data['Low'].rolling(k_period).min()
-    data['High_14'] = data['High'].rolling(k_period).max()
-    data['%K'] = 100 * ((data['Close'] - data['Low_14']) / (data['High_14'] - data['Low_14']))
-    data['%D'] = data['%K'].rolling(d_period).mean()
-
-    current_stoch = data['%K'].iloc[-1]
-    previous_stoch = data['%K'].iloc[-2]
-    current_price = data['Close'].iloc[-1]
-
-    # --- RENKO (Brick Size = 20)
-    brick_size = 20
-    bricks = []
-    last_brick_price = data['Close'].iloc[0]
-    for _, row in data.iterrows():
-        diff = row['Close'] - last_brick_price
-        if diff > 0:
-            for _ in range(int(diff // brick_size)):
-                bricks.append(1)
-                last_brick_price += brick_size
-        elif diff < 0:
-            for _ in range(int(abs(diff) // brick_size)):
-                bricks.append(-1)
-                last_brick_price -= brick_size
-
-    if len(bricks) < 3:
-        return "Not enough Renko movement.", None
-
-    last_3 = bricks[-3:]
-    three_green = all(b == 1 for b in last_3)
-    three_red = all(b == -1 for b in last_3)
-    pattern = "Green, Green, Green" if three_green else "Red, Red, Red" if three_red else "Mixed/Choppy"
-
-    # --- SIGNAL LOGIC
-    stoch_cross_above_20 = previous_stoch <= 20 and current_stoch > 20
-    stoch_cross_below_80 = previous_stoch >= 80 and current_stoch < 80
-    is_buy = three_green and (stoch_cross_above_20 or (20 < current_stoch < 40))
-    is_sell = three_red and (stoch_cross_below_80 or (60 < current_stoch < 80))
+    current = data["%K"].iloc[-1]
+    previous = data["%K"].iloc[-2]
+    price = data["Close"].iloc[-1]
 
     signal = "NO ENTRY"
-    strike = None
-    if is_buy:
+
+    if previous <= 20 and current > 20:
         signal = "BUY CALL"
-        strike = round((current_price + 300) / 50) * 50
-    elif is_sell:
+    elif previous >= 80 and current < 80:
         signal = "BUY PUT"
-        strike = round((current_price - 300) / 50) * 50
 
     output = (
         f"Date: {datetime.now().strftime('%Y-%m-%d')}\n"
-        f"Nifty Price: {current_price:.2f}\n"
-        f"Stoch: {current_stoch:.2f} (Prev: {previous_stoch:.2f})\n"
-        f"Renko: {pattern}\n"
+        f"Nifty: {price:.2f}\n"
+        f"Stoch: {current:.2f}\n"
         f"Signal: {signal}"
     )
-    if strike:
-        output += f"\nStrike: {strike}"
 
     return output, signal
 
 # =========================
-# WEBHOOK HANDLER
+# VERCEL WEBHOOK HANDLER
 # =========================
-def handler(req):
-    """Vercel serverless function entry point."""
-    if req.method != "POST":
-        return {"status": 200, "body": "OK"}  # Only handle POST
+def handler(request):
+    if request.method != "POST":
+        return {"statusCode": 200, "body": "OK"}
 
-    body = json.loads(req.data)
-    update = Update.de_json(body, bot)
+    update = Update.de_json(json.loads(request.body), bot)
 
-    # Handle /run command
-    if update.message and update.message.text == "/run":
+    if not update.message or not update.message.text:
+        return {"statusCode": 200, "body": "Ignored"}
+
+    if update.message.text == "/run":
         output, signal = run_trading_strategy()
-        bot.send_message(chat_id=update.effective_chat.id, text=output)
 
-        # Fetch last signal from Supabase
-        last_signal_data = supabase.table(TABLE_NAME).select("signal").order("id", desc=True).limit(1).execute()
-        last_signal = last_signal_data.data[0]["signal"] if last_signal_data.data else None
+        # Reply to user
+        bot.send_message(chat_id=update.message.chat_id, text=output)
 
-        # Send alert only if signal changed
-        if signal and signal != last_signal:
-            bot.send_message(chat_id=CHAT_ID, text=f"⚡ New Signal: {signal}\n{output}")
+        # Get last signal
+        res = supabase.table(TABLE_NAME).select("signal").order("id", desc=True).limit(1).execute()
+        last_signal = res.data[0]["signal"] if res.data else None
+
+        # Send alert only on change
+        if signal != last_signal:
+            bot.send_message(chat_id=CHAT_ID, text=f"⚡ SIGNAL CHANGED\n{output}")
             supabase.table(TABLE_NAME).insert({"signal": signal}).execute()
 
-    return {"status": 200, "body": "OK"}
+    return {"statusCode": 200, "body": "OK"}
